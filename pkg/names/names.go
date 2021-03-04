@@ -37,6 +37,10 @@ const NonCriticalAnnotation = "networkoperator.openshift.io/non-critical"
 // that executing network migration (switching the default network type of the cluster) is allowed.
 const NetworkMigrationAnnotation = "networkoperator.openshift.io/network-migration"
 
+// NetworkConfigurationHashAnnotation is an annotation on the networks.operator.openshift.io daemonsets
+// to indicate the current configuration hash so it can reload if it has changed
+const NetworkConfigurationHashAnnotation = "networkoperator.openshift.io/configuration-md5sum"
+
 // OVNRaftClusterInitiator is an annotation on the networks.operator.openshift.io CR to indicate
 // which node IP was the raft cluster initiator. The NB and SB DB will be initialized by the same member.
 const OVNRaftClusterInitiator = "networkoperator.openshift.io/ovn-cluster-initiator"

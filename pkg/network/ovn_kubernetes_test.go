@@ -1,6 +1,7 @@
 package network
 
 import (
+	"crypto/md5"
 	"fmt"
 	"os"
 	"reflect"
@@ -12,12 +13,14 @@ import (
 	. "github.com/onsi/gomega"
 
 	appsv1 "k8s.io/api/apps/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	uns "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	operv1 "github.com/openshift/api/operator/v1"
 	"github.com/openshift/cluster-network-operator/pkg/apply"
 	"github.com/openshift/cluster-network-operator/pkg/bootstrap"
+	"github.com/openshift/cluster-network-operator/pkg/names"
 	"github.com/openshift/cluster-network-operator/pkg/util/k8s"
 )
 
@@ -292,8 +295,12 @@ enabled=true`,
 			}
 			objs, err := renderOVNKubernetes(config, bootstrapResult, manifestDirOvn)
 			g.Expect(err).NotTo(HaveOccurred())
-			confFile := extractOVNKubeConfig(g, objs)
+			confFile, err := getOVNKubeConfig(objs)
+			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(confFile).To(Equal(strings.TrimSpace(tc.expected)))
+			// check that the config hash in the annotations
+			configSum := fmt.Sprintf("%x", md5.Sum([]byte(confFile)))
+			g.Expect(checkDaemonsetAnnotation(g, objs, names.NetworkConfigurationHashAnnotation, configSum)).To(BeTrue())
 		})
 	}
 
@@ -543,8 +550,8 @@ func TestOVNKubernetesIsSafe(t *testing.T) {
 	g.Expect(errs[1]).To(MatchError("cannot change ovn-kubernetes genevePort"))
 }
 
-// TestOVNKubernetesShouldUpdateMaster checks to see that
-func TestOVNKubernetestShouldUpdateMaster(t *testing.T) {
+// TestOVNKubernetesShouldUpdateMasterOnUpgrade checks to see that
+func TestOVNKubernetestShouldUpdateMasterOnUpgrade(t *testing.T) {
 
 	for idx, tc := range []struct {
 		expectNode   bool
@@ -554,7 +561,7 @@ func TestOVNKubernetestShouldUpdateMaster(t *testing.T) {
 		rv           string // release version
 	}{
 
-		// No node and master - upgrade = true
+		// No node and master - upgrade = true and config the same
 		{
 			expectNode:   true,
 			expectMaster: true,
@@ -1031,11 +1038,215 @@ metadata:
 			// if we expect a master update, the original master and the rendered one must be different
 			g.Expect(tc.expectMaster).To(Equal(!reflect.DeepEqual(renderedMaster, usMaster)), "Check master rendering")
 
-			updateNode, updateMaster := shouldUpdateOVNK(node, master, tc.rv)
+			updateNode, updateMaster := shouldUpdateOVNKonUpgrade(node, master, tc.rv)
 			g.Expect(updateNode).To(Equal(tc.expectNode), "Check node")
 			g.Expect(updateMaster).To(Equal(tc.expectMaster), "Check master")
 		})
 	}
+}
+
+func TestOVNKubernetestShouldUpdateMasterOnConfigurationChanges(t *testing.T) {
+
+	for _, tc := range []struct {
+		name         string
+		node         *appsv1.DaemonSet
+		master       *appsv1.DaemonSet
+		configSum    string
+		expectNode   bool
+		expectMaster bool
+	}{
+		{
+			name:         "all empty",
+			node:         &appsv1.DaemonSet{},
+			master:       &appsv1.DaemonSet{},
+			expectNode:   true,
+			expectMaster: true,
+			configSum:    "",
+		},
+		{
+			name:         "fresh cluster",
+			node:         &appsv1.DaemonSet{},
+			master:       &appsv1.DaemonSet{},
+			expectNode:   true,
+			expectMaster: true,
+			configSum:    "333c07b6cdc1cd9dcea624f073df0c05",
+		},
+		{
+			name: "no configuration change",
+			node: &appsv1.DaemonSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ovnkube-node",
+					Namespace: "openshift-cluster-network-operator",
+					Annotations: map[string]string{
+						names.NetworkConfigurationHashAnnotation: "333c07b6cdc1cd9dcea624f073df0c05",
+					},
+				},
+			},
+			master: &appsv1.DaemonSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ovnkube-master",
+					Namespace: "openshift-cluster-network-operator",
+					Annotations: map[string]string{
+						names.NetworkConfigurationHashAnnotation: "333c07b6cdc1cd9dcea624f073df0c05",
+					},
+					Generation: 1,
+				},
+				Status: appsv1.DaemonSetStatus{
+					CurrentNumberScheduled: 3,
+					DesiredNumberScheduled: 3,
+					NumberAvailable:        3,
+					NumberMisscheduled:     0,
+					NumberReady:            3,
+					ObservedGeneration:     2,
+					UpdatedNumberScheduled: 3,
+				},
+			},
+			expectNode:   true,
+			expectMaster: true,
+			configSum:    "333c07b6cdc1cd9dcea624f073df0c05",
+		},
+		{
+			name: "configuration changed",
+			node: &appsv1.DaemonSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ovnkube-node",
+					Namespace: "openshift-cluster-network-operator",
+					Annotations: map[string]string{
+						names.NetworkConfigurationHashAnnotation: "333c07b6cdc1cd9dcea624f073df0c05",
+					},
+				},
+			},
+			master: &appsv1.DaemonSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ovnkube-master",
+					Namespace: "openshift-cluster-network-operator",
+					Annotations: map[string]string{
+						names.NetworkConfigurationHashAnnotation: "333c07b6cdc1cd9dcea624f073df0c05",
+					},
+				},
+			},
+			expectNode:   false,
+			expectMaster: true,
+			configSum:    "507ced5d40560df574b9279a2d2fa763",
+		},
+		{
+			name: "configuration changed, master updated and node remaining",
+			node: &appsv1.DaemonSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ovnkube-node",
+					Namespace: "openshift-cluster-network-operator",
+					Annotations: map[string]string{
+						names.NetworkConfigurationHashAnnotation: "333c07b6cdc1cd9dcea624f073df0c05",
+					},
+				},
+			},
+			master: &appsv1.DaemonSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ovnkube-master",
+					Namespace: "openshift-cluster-network-operator",
+					Annotations: map[string]string{
+						names.NetworkConfigurationHashAnnotation: "507ced5d40560df574b9279a2d2fa763",
+					},
+					Generation: 1,
+				},
+				Status: appsv1.DaemonSetStatus{
+					CurrentNumberScheduled: 3,
+					DesiredNumberScheduled: 3,
+					NumberAvailable:        3,
+					NumberMisscheduled:     0,
+					NumberReady:            3,
+					ObservedGeneration:     2,
+					UpdatedNumberScheduled: 3,
+				},
+			},
+			expectNode:   true,
+			expectMaster: true,
+			configSum:    "507ced5d40560df574b9279a2d2fa763",
+		},
+		{
+			name: "configuration changed, master updated and node remaining but still rolling out",
+			node: &appsv1.DaemonSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ovnkube-node",
+					Namespace: "openshift-cluster-network-operator",
+					Annotations: map[string]string{
+						names.NetworkConfigurationHashAnnotation: "333c07b6cdc1cd9dcea624f073df0c05",
+					},
+				},
+			},
+			master: &appsv1.DaemonSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ovnkube-master",
+					Namespace: "openshift-cluster-network-operator",
+					Annotations: map[string]string{
+						names.NetworkConfigurationHashAnnotation: "507ced5d40560df574b9279a2d2fa763",
+					},
+					Generation: 1,
+				},
+				Status: appsv1.DaemonSetStatus{
+					CurrentNumberScheduled: 3,
+					DesiredNumberScheduled: 3,
+					NumberAvailable:        2,
+					NumberUnavailable:      1,
+					NumberMisscheduled:     0,
+					NumberReady:            2,
+					ObservedGeneration:     2,
+					UpdatedNumberScheduled: 3,
+				},
+			},
+			expectNode:   false,
+			expectMaster: true,
+			configSum:    "507ced5d40560df574b9279a2d2fa763",
+		},
+		// this should not be possible, because configuration changes always update master first
+		{
+			name: "configuration changed, node updated and master remaining",
+			node: &appsv1.DaemonSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ovnkube-node",
+					Namespace: "openshift-cluster-network-operator",
+					Annotations: map[string]string{
+						names.NetworkConfigurationHashAnnotation: "507ced5d40560df574b9279a2d2fa763",
+					},
+				},
+			},
+			master: &appsv1.DaemonSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ovnkube-master",
+					Namespace: "openshift-cluster-network-operator",
+					Annotations: map[string]string{
+						names.NetworkConfigurationHashAnnotation: "333c07b6cdc1cd9dcea624f073df0c05",
+					},
+					Generation: 2,
+				},
+				Status: appsv1.DaemonSetStatus{
+					CurrentNumberScheduled: 3,
+					DesiredNumberScheduled: 3,
+					NumberAvailable:        3,
+					NumberMisscheduled:     0,
+					NumberReady:            3,
+					ObservedGeneration:     2,
+					UpdatedNumberScheduled: 3,
+				},
+			},
+			expectNode:   false,
+			expectMaster: true,
+			configSum:    "507ced5d40560df574b9279a2d2fa763",
+		},
+	} {
+
+		t.Run(tc.name, func(t *testing.T) {
+			updateNode, updateMaster := shouldUpdateOVNKonConfigChange(tc.node, tc.master, tc.configSum)
+			if updateNode != tc.expectNode {
+				t.Errorf("Expected node update: %v received %v", tc.expectNode, updateNode)
+			}
+			if updateMaster != tc.expectMaster {
+				t.Errorf("Expected node update: %v received %v", tc.expectNode, updateNode)
+			}
+
+		})
+	}
+
 }
 
 func findInObjs(group, kind, name, namespace string, objs []*uns.Unstructured) *uns.Unstructured {
@@ -1049,16 +1260,37 @@ func findInObjs(group, kind, name, namespace string, objs []*uns.Unstructured) *
 	return nil
 }
 
-func extractOVNKubeConfig(g *WithT, objs []*uns.Unstructured) string {
+// checkDaemonsetAnnotation check that all the daemonset have the annotation with the
+// same key and value
+func checkDaemonsetAnnotation(g *WithT, objs []*uns.Unstructured, key, value string) bool {
+	if key == "" || value == "" {
+		return false
+	}
 	for _, obj := range objs {
-		if obj.GetKind() == "ConfigMap" && obj.GetName() == "ovnkube-config" {
-			val, ok, err := uns.NestedString(obj.Object, "data", "ovnkube.conf")
-			g.Expect(err).NotTo(HaveOccurred())
-			g.Expect(ok).To(BeTrue())
-			return string(val)
+		if obj.GetAPIVersion() == "apps/v1" && obj.GetKind() == "DaemonSet" &&
+			(obj.GetName() == "ovnkube-master" || obj.GetName() == "ovnkube-node") {
+
+			// check daemonset annotation
+			anno := obj.GetAnnotations()
+			if anno == nil {
+				return false
+			}
+			v, ok := anno[key]
+			if !ok || v != value {
+				return false
+			}
+			// check template annotation
+			anno, _, _ = uns.NestedStringMap(obj.Object, "spec", "template", "metadata", "annotations")
+			if anno == nil {
+				return false
+			}
+			v, ok = anno[key]
+			if !ok || v != value {
+				return false
+			}
 		}
 	}
-	return ""
+	return true
 }
 
 func ptrToUint32(x uint32) *uint32 {

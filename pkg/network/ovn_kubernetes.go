@@ -2,6 +2,7 @@ package network
 
 import (
 	"context"
+	"crypto/md5"
 	"fmt"
 	"math"
 	"net"
@@ -174,7 +175,26 @@ func renderOVNKubernetes(conf *operv1.NetworkSpec, bootstrapResult *bootstrap.Bo
 	}
 	objs = append(objs, manifests...)
 
-	updateNode, updateMaster := shouldUpdateOVNK(bootstrapResult.OVN.ExistingNodeDaemonset, bootstrapResult.OVN.ExistingMasterDaemonset, os.Getenv("RELEASE_VERSION"))
+	// Get current configuration and obtain the md5 hash, this is equivalent to
+	// oc -n openshift-ovn-kubernetes get cm ovnkube-config \
+	// -o jsonpath='{.spec.template.data.ovnkube\.conf}' | md5sum
+	ovnkubeConfig, err := getOVNKubeConfig(objs)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to get onvkube-config")
+	}
+	configSum := fmt.Sprintf("%x", md5.Sum([]byte(ovnkubeConfig)))
+
+	updateNode, updateMaster := shouldUpdateOVNKonConfigChange(bootstrapResult.OVN.ExistingNodeDaemonset, bootstrapResult.OVN.ExistingMasterDaemonset, configSum)
+	// Annotate the daemonset and the daemonset template with the current configuration hash
+	err = setOVNDaemonsetAnnotation(objs, names.NetworkConfigurationHashAnnotation, configSum)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to set onvkube-config md5sum annotation on daemonsets")
+	}
+
+	// only process upgrades if there were no configuration changes
+	if updateMaster && updateNode {
+		updateNode, updateMaster = shouldUpdateOVNKonUpgrade(bootstrapResult.OVN.ExistingNodeDaemonset, bootstrapResult.OVN.ExistingMasterDaemonset, os.Getenv("RELEASE_VERSION"))
+	}
 
 	// If we need to delay master or node daemonset rollout, then we'll replace the new one with the existing one
 	if !updateMaster {
@@ -495,12 +515,40 @@ func listenDualStack(masterIP string) string {
 	}
 }
 
-// shouldUpdateOVNK determines if we should roll out changes to
-// the master and node daemonsets.
-//
-// On upgrades, we roll out nodes first, then masters. Downgrades, we do the
-// opposite.
-func shouldUpdateOVNK(existingNode, existingMaster *appsv1.DaemonSet, releaseVersion string) (updateNode, updateMaster bool) {
+// shouldUpdateOVNKonConfigChange determines if we should roll out changes to
+// the master and node daemonsets on configuration changes.
+// We rollout changes on masters first when there is a configuration change.
+// Configuration changes take precedence over upgrades.
+func shouldUpdateOVNKonConfigChange(existingNode, existingMaster *appsv1.DaemonSet, configSum string) (updateNode, updateMaster bool) {
+	// Fresh cluster - full steam ahead!
+	if existingNode == nil || existingMaster == nil {
+		return true, true
+	}
+	// Check current configuration hash
+	nodeConfigSum := existingNode.GetAnnotations()[names.NetworkConfigurationHashAnnotation]
+	masterConfigSum := existingMaster.GetAnnotations()[names.NetworkConfigurationHashAnnotation]
+	// if there is no annotations this is a fresh cluster
+	// there is no configuration change
+	if nodeConfigSum == "" || masterConfigSum == "" {
+		return true, true
+	}
+	// If the master config has changed update only the master, the node will be updated later
+	if masterConfigSum != configSum {
+		klog.V(2).Infof("Configuration change detected %s, updating OVN-Kubernetes master with config hash %s", configSum, masterConfigSum)
+		return false, true
+	}
+	// Don't rollout the changes until the master daemonset has been updated
+	if daemonSetProgressing(existingMaster, false) {
+		klog.V(2).Infof("Waiting for OVN-Kubernetes master update to roll out before updating node")
+		return false, true
+	}
+	return true, true
+}
+
+// shouldUpdateOVNKonUpgrade determines if we should roll out changes to
+// the master and node daemonsets on upgrades. We roll out nodes first,
+// then masters. Downgrades, we do the opposite.
+func shouldUpdateOVNKonUpgrade(existingNode, existingMaster *appsv1.DaemonSet, releaseVersion string) (updateNode, updateMaster bool) {
 	// Fresh cluster - full steam ahead!
 	if existingNode == nil || existingMaster == nil {
 		return true, true
@@ -621,4 +669,45 @@ func daemonSetProgressing(ds *appsv1.DaemonSet, allowHung bool) bool {
 	}
 
 	return true
+}
+
+func getOVNKubeConfig(objs []*uns.Unstructured) (string, error) {
+	for _, obj := range objs {
+		if obj.GetKind() == "ConfigMap" && obj.GetName() == "ovnkube-config" {
+			val, ok, err := uns.NestedString(obj.Object, "data", "ovnkube.conf")
+			if err != nil || !ok {
+				return "", errors.Wrapf(err, "failed to get ovnkube config from %v", obj)
+			}
+			return string(val), nil
+		}
+	}
+	return "", errors.New("not Configmap ovnkube-config present with the OVN configuration")
+}
+
+// setOVNDaemonsetAnnotation annotates the OVNkube master and node daemonset
+// it also annotated the template with the provided key and value to force the rollout
+func setOVNDaemonsetAnnotation(objs []*uns.Unstructured, key, value string) error {
+	for _, obj := range objs {
+		if obj.GetAPIVersion() == "apps/v1" && obj.GetKind() == "DaemonSet" &&
+			(obj.GetName() == "ovnkube-master" || obj.GetName() == "ovnkube-node") {
+			// set daemonset annotation
+			anno := obj.GetAnnotations()
+			if anno == nil {
+				anno = map[string]string{}
+			}
+			anno[key] = value
+			obj.SetAnnotations(anno)
+
+			// set pod template annotation
+			anno, _, _ = uns.NestedStringMap(obj.Object, "spec", "template", "metadata", "annotations")
+			if anno == nil {
+				anno = map[string]string{}
+			}
+			anno[key] = value
+			if err := uns.SetNestedStringMap(obj.Object, anno, "spec", "template", "metadata", "annotations"); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
