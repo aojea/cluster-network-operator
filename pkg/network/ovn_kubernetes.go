@@ -24,6 +24,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	uns "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	types "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
@@ -621,4 +622,85 @@ func daemonSetProgressing(ds *appsv1.DaemonSet, allowHung bool) bool {
 	}
 
 	return true
+}
+
+// convertDualStackOVN handles the OVNKubernetes daemonset conversion to dualstack
+// It rollout the changes on the master daemonset first, and on the node daemonset
+// once the master has finished.
+func convertDualStackOVN(bootstrapResult *bootstrap.BootstrapResult, objs []*uns.Unstructured) (bool, error) {
+	// rollout the changes on the masters applying the migration annotation to the daemonset
+	masterDaemonset := findInObjs("apps", "DaemonSet", "ovnkube-master", "openshift-ovn-kubernetes", objs)
+	if masterDaemonset == nil {
+		return false, fmt.Errorf("can not find ovnkube-master daemonset")
+	}
+	if _, ok := masterDaemonset.GetAnnotations()[names.NetworkDualStackMigrationAnnotation]; !ok {
+		klog.V(2).Infof("Dual-stack conversion in progress, updating OVN Kubernetes master daemonset")
+		err := setOVNDaemonsetAnnotation(masterDaemonset, names.NetworkDualStackMigrationAnnotation, "true")
+		if err != nil {
+			return false, errors.Wrapf(err, "error annotating ovnkube-master daemonset")
+		}
+		// we still need to do more changes
+		return true, nil
+	}
+	// Don't rollout the changes on nodes until the master daemonset has been updated
+	if daemonSetProgressing(bootstrapResult.OVN.ExistingMasterDaemonset, false) {
+		klog.V(2).Infof("Waiting for OVN-Kubernetes master update to roll out before updating node")
+		return true, nil
+	}
+
+	nodeDaemonset := findInObjs("apps", "DaemonSet", "ovnkube-node", "openshift-ovn-kubernetes", objs)
+	if nodeDaemonset == nil {
+		return false, fmt.Errorf("can not find ovnkube-node daemonset")
+	}
+	if _, ok := nodeDaemonset.GetAnnotations()[names.NetworkDualStackMigrationAnnotation]; !ok {
+		klog.V(2).Infof("Dual-stack conversion in progress, updating OVN Kubernetes nodes daemonset")
+		err := setOVNDaemonsetAnnotation(nodeDaemonset, names.NetworkDualStackMigrationAnnotation, "true")
+		if err != nil {
+			return false, errors.Wrapf(err, "error annotating ovnkube-node daemonset")
+		}
+	}
+
+	// no work left
+	return false, nil
+}
+
+// setOVNDaemonsetAnnotation annotates an unstructured daemonset object
+// it also annotates the template with the provided key and value to force the rollout
+func setOVNDaemonsetAnnotation(obj *uns.Unstructured, key, value string) error {
+	if obj == nil {
+		return fmt.Errorf("empty object")
+	}
+	if obj.GetAPIVersion() != "apps/v1" || obj.GetKind() != "DaemonSet" {
+		return fmt.Errorf("invalid object, expecting a daemonset, received: %v", obj)
+	}
+
+	// set daemonset annotation
+	anno := obj.GetAnnotations()
+	if anno == nil {
+		anno = map[string]string{}
+	}
+	anno[key] = value
+	obj.SetAnnotations(anno)
+
+	// set pod template annotation
+	anno, _, _ = uns.NestedStringMap(obj.Object, "spec", "template", "metadata", "annotations")
+	if anno == nil {
+		anno = map[string]string{}
+	}
+	anno[key] = value
+	if err := uns.SetNestedStringMap(obj.Object, anno, "spec", "template", "metadata", "annotations"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func findInObjs(group, kind, name, namespace string, objs []*uns.Unstructured) *uns.Unstructured {
+	for _, obj := range objs {
+		if (obj.GroupVersionKind().GroupKind() == schema.GroupKind{Group: group, Kind: kind} &&
+			obj.GetNamespace() == namespace &&
+			obj.GetName() == name) {
+			return obj
+		}
+	}
+	return nil
 }

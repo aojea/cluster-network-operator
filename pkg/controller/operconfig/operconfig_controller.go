@@ -95,11 +95,12 @@ var _ reconcile.Reconciler = &ReconcileOperConfig{}
 type ReconcileOperConfig struct {
 	// This client, initialized using mgr.Client() above, is a split client
 	// that reads objects from the cache and writes to the apiserver
-	client        client.Client
-	scheme        *runtime.Scheme
-	status        *statusmanager.StatusManager
-	mapper        meta.RESTMapper
-	podReconciler *ReconcilePods
+	client              client.Client
+	scheme              *runtime.Scheme
+	status              *statusmanager.StatusManager
+	mapper              meta.RESTMapper
+	podReconciler       *ReconcilePods
+	configurationChange bool
 }
 
 // Reconcile updates the state of the cluster to match that which is desired
@@ -173,7 +174,7 @@ func (r *ReconcileOperConfig) Reconcile(request reconcile.Request) (reconcile.Re
 	network.FillDefaults(&operConfig.Spec, prev)
 
 	// Compare against previous applied configuration to see if this change
-	// is safe.
+	// is safe and check if we need to handle a configuration change.
 	if prev != nil {
 		// Check if the operator is put in the 'Network Migration' mode.
 		if _, ok := operConfig.GetAnnotations()[names.NetworkMigrationAnnotation]; !ok {
@@ -186,6 +187,8 @@ func (r *ReconcileOperConfig) Reconcile(request reconcile.Request) (reconcile.Re
 					fmt.Sprintf("Not applying unsafe configuration change: %v. Use 'oc edit network.operator.openshift.io cluster' to undo the change.", err))
 				return reconcile.Result{}, err
 			}
+
+			r.configurationChange = !reflect.DeepEqual(prev, &operConfig.Spec)
 		}
 	}
 
@@ -216,6 +219,20 @@ func (r *ReconcileOperConfig) Reconcile(request reconcile.Request) (reconcile.Re
 		r.status.SetDegraded(statusmanager.OperatorConfig, "RenderError",
 			fmt.Sprintf("Internal error while rendering operator configuration: %v", err))
 		return reconcile.Result{}, err
+	}
+
+	// handle configuration changes
+	// FIXME: this is, right now, OVN and dualstack specific, but it can be generalized
+	// to deal with all the configuration change management in all components.
+	if r.configurationChange {
+		inProgress, err := network.ChangeManager(&operConfig.Spec, prev, bootstrapResult, objs)
+		if err != nil {
+			log.Printf("Failed to handle configuration changes: %v", err)
+			r.status.SetDegraded(statusmanager.OperatorConfig, "RenderError",
+				fmt.Sprintf("Internal error while handling configuration change: %v", err))
+			return reconcile.Result{}, err
+		}
+		r.configurationChange = inProgress
 	}
 
 	// The first object we create should be the record of our applied configuration. The last object we create is config.openshift.io/v1/Network.Status

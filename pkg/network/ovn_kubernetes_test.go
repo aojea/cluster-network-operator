@@ -13,7 +13,6 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	uns "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	operv1 "github.com/openshift/api/operator/v1"
 	"github.com/openshift/cluster-network-operator/pkg/apply"
@@ -1036,17 +1035,6 @@ metadata:
 			g.Expect(updateMaster).To(Equal(tc.expectMaster), "Check master")
 		})
 	}
-}
-
-func findInObjs(group, kind, name, namespace string, objs []*uns.Unstructured) *uns.Unstructured {
-	for _, obj := range objs {
-		if (obj.GroupVersionKind().GroupKind() == schema.GroupKind{Group: group, Kind: kind} &&
-			obj.GetNamespace() == namespace &&
-			obj.GetName() == name) {
-			return obj
-		}
-	}
-	return nil
 }
 
 func extractOVNKubeConfig(g *WithT, objs []*uns.Unstructured) string {
